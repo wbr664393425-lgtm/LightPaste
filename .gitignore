@@ -1,0 +1,18 @@
+# Local build products and generated app bundles
+.build/
+.swiftpm/
+*.app/
+.DS_Store
+
+# Local configuration, signing material and clipboard databases
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.mobileprovision
+*.provisionprofile
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.lightpaste
