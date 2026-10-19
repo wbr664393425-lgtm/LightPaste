@@ -18,6 +18,12 @@
 - 构建需要 Apple Command Line Tools、`python3` 和 `zsh`，无需完整 Xcode。
 - 当前主要在 Apple Silicon 上构建和使用，**Intel Mac 尚未验证**。
 
+## 下载安装
+
+下载 [LightPaste 0.6.0 DMG](https://github.com/wbr664393425-lgtm/LightPaste/releases/download/v0.6.0/LightPaste-0.6.0-macOS-arm64.dmg)，仅适用于 **Apple Silicon Mac、macOS 13 或更新版本**。打开 DMG 后，将“轻贴”拖入 Applications（应用程序）文件夹。
+
+当前安装包使用临时签名，未经过 Developer ID 签名与 Apple 公证。首次启动若被系统阻止，可按 [Apple 的官方说明](https://support.apple.com/en-us/102445)在“系统设置 → 隐私与安全性”查看是否可允许打开。
+
 ## 构建与启动
 
 安装 Command Line Tools 后，确认 `python3` 可用，再运行：
