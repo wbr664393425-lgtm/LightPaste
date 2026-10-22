@@ -42,6 +42,7 @@ final class AppController: NSObject, ObservableObject {
     @Published var maxItems = 1000
     @Published var excludedAppsText = ""
     @Published private(set) var hotKey = HotKeySpec.default
+    @Published private(set) var quickHotKey = HotKeySpec.quickDefault
     @Published var drawerEdge: DrawerEdge = .bottom
     @Published var cardSize: CardSize = .standard
     @Published var linkPreviewEnabled = true
@@ -64,6 +65,8 @@ final class AppController: NSObject, ObservableObject {
     private let hotKeys = HotKeyManager()
     private let hud = FeedbackHUD()
     private var compactPanel: ClipboardWindow?
+    private var quickPanel: ClipboardWindow?
+    let quick: QuickPasteModel
     private var drawerHost: NSView?
     private var drawerEffect: NSVisualEffectView?
     private var settingsWindow: NSWindow?
@@ -73,6 +76,9 @@ final class AppController: NSObject, ObservableObject {
     private var outsideClickMonitor: Any?
     private var flagsMonitor: Any?
     private var queueMonitor: Any?
+    private var aliasMonitor: Any?
+    /// What has been typed since the last “;” in another app, while it can still become an alias.
+    private var aliasTyped: (text: String, pid: pid_t)?
     private var queueIDs: [UUID] = []
     private var drawerFrames: (shown: CGRect, hidden: CGRect)?
     private var drawerAnimationID = 0
@@ -81,6 +87,7 @@ final class AppController: NSObject, ObservableObject {
     private var statusMenu: NSMenu?
     private var previousApplication: NSRunningApplication?
     private var registeredHotKey: HotKeySpec?
+    private var registeredQuickHotKey: HotKeySpec?
     private var rangeAnchor: UUID?
     private var subscription: AnyCancellable?
     private var activationObserver: NSObjectProtocol?
@@ -97,12 +104,18 @@ final class AppController: NSObject, ObservableObject {
     private let linkIcons = NSCache<NSString, NSImage>()
     /// Links whose stored icon is missing, so scrolling does not re-read the database for them.
     private var missingLinkIcons = Set<UUID>()
+    private let linkImages = NSCache<NSString, NSImage>()
+    private var missingLinkImages = Set<UUID>()
+    private var linkTints: [UUID: NSColor?] = [:]
+    /// Links fetched before 0.7 stored no icon or cover; each is fetched once more after the upgrade.
+    private var linkRefreshQueue = Set<UUID>()
 
     init(directory: URL, defaults: UserDefaults = .standard) throws {
         self.directory = directory
         self.defaults = defaults
         resources = ClipResources(directory: directory)
         store = try HistoryStore(directory: directory)
+        quick = QuickPasteModel(store: store)
         super.init()
         images.countLimit = 60
         defaults.register(defaults: ["retentionDays": 30, "maxItems": 1000, "drawerEdge": "bottom", "cardSize": "standard",
@@ -117,6 +130,10 @@ final class AppController: NSObject, ObservableObject {
         } else {
             // 0.3 stored one of three presets.
             hotKey = .legacy(option: defaults.integer(forKey: "shortcutOption"))
+        }
+        if defaults.object(forKey: "quickHotKeyCode") != nil {
+            quickHotKey = HotKeySpec(keyCode: UInt32(defaults.integer(forKey: "quickHotKeyCode")),
+                                     carbonModifiers: UInt32(defaults.integer(forKey: "quickHotKeyModifiers")))
         }
         drawerEdge = DrawerEdge(rawValue: defaults.string(forKey: "drawerEdge") ?? "bottom") ?? .bottom
         cardSize = CardSize(rawValue: defaults.string(forKey: "cardSize") ?? "standard") ?? .standard
@@ -138,10 +155,13 @@ final class AppController: NSObject, ObservableObject {
                 self.sourceOptionsCache = nil
                 self.objectWillChange.send()
                 self.refreshResults()
+                if self.quickPanel?.isVisible == true { self.quick.refresh() }
                 self.scheduleEnrichment()
             }
         }
-        hotKeys.onTrigger = { [weak self] in self?.togglePanel() }
+        hotKeys.onTrigger = { [weak self] id in
+            if id == 2 { self?.toggleQuickPaste() } else { self?.togglePanel() }
+        }
         applySettings()
         createStatusItem()
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -169,7 +189,15 @@ final class AppController: NSObject, ObservableObject {
         maintenance = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.pruneHistory(); self?.refreshPermissions() }
         }
+        if defaults.integer(forKey: "linkPreviewRevision") < 2 {
+            linkRefreshQueue = Set(store.items.lazy.filter { item in
+                item.kind == .link && item.linkTitle != nil && item.detail != .sensitive
+                    && self.store.linkIcon(for: item.id) == nil && self.store.linkImage(for: item.id) == nil
+            }.map(\.id))
+            defaults.set(2, forKey: "linkPreviewRevision")
+        }
         monitor.start()
+        installAliasMonitor()
         refreshResults()
         scheduleEnrichment()
     }
@@ -413,6 +441,33 @@ final class AppController: NSObject, ObservableObject {
         return image
     }
 
+    /// The page's cover image, when the site offers one.
+    func linkImage(for item: ClipItem) -> NSImage? {
+        guard item.kind == .link, item.linkTitle?.isEmpty == false else { return nil }
+        let key = item.id.uuidString as NSString
+        if let image = linkImages.object(forKey: key) { return image }
+        guard !missingLinkImages.contains(item.id) else { return nil }
+        guard let data = store.linkImage(for: item.id), let image = NSImage(data: data) else {
+            missingLinkImages.insert(item.id); return nil
+        }
+        linkImages.setObject(image, forKey: key)
+        return image
+    }
+
+    /// The site icon's main color, for link cards without a cover.
+    func linkTint(for item: ClipItem) -> NSColor? {
+        if let cached = linkTints[item.id] { return cached }
+        let color = linkIcon(for: item).flatMap(IconProvider.averageColor)
+        linkTints[item.id] = color
+        return color
+    }
+
+    private func forgetLinkPreview(_ id: UUID) {
+        missingLinkIcons.remove(id); missingLinkImages.remove(id); linkTints[id] = nil
+        linkIcons.removeObject(forKey: id.uuidString as NSString)
+        linkImages.removeObject(forKey: id.uuidString as NSString)
+    }
+
     func previewImage(for item: ClipItem) -> NSImage? {
         guard item.kind == .image else { return nil }
         let key = "preview-\(item.id.uuidString)" as NSString
@@ -438,16 +493,19 @@ final class AppController: NSObject, ObservableObject {
             linkFetches.values.forEach { $0.task.cancel() }
             return
         }
-        let pending = store.items.lazy.filter { $0.kind == .link && $0.linkTitle == nil }
+        let pending = store.items.lazy.filter { $0.kind == .link && ($0.linkTitle == nil || self.linkRefreshQueue.contains($0.id)) }
             .filter { self.linkFetches[$0.id] == nil && !self.enrichmentAttempted.contains($0.id) }
             .prefix(max(0, 2 - linkFetches.count))
         for item in pending {
             enrichmentAttempted.insert(item.id)
+            let refreshing = linkRefreshQueue.remove(item.id) != nil
             // Secrets, internal addresses and links with credentials are not fetched automatically;
             // an empty title records that, and the card menu offers a one-time fetch for the safe ones.
             guard let url = LinkPreviewService.webURL(in: item), item.detail != .sensitive,
                   LinkPreviewService.allowsAutomaticFetch(url) else {
-                try? store.setLinkPreview(item.id, title: "", iconPNG: nil); continue
+                // A refresh leaves an existing title alone when the link may not be fetched automatically.
+                if !refreshing { try? store.setLinkPreview(item.id, title: "", iconPNG: nil) }
+                continue
             }
             startLinkFetch(item.id, url: url)
         }
@@ -470,11 +528,14 @@ final class AppController: NSObject, ObservableObject {
             guard let item = self.store.items.first(where: { $0.id == id }), LinkPreviewService.webURL(in: item) == url else {
                 self.scheduleEnrichment(); return
             }
-            self.missingLinkIcons.remove(id)
-            self.linkIcons.removeObject(forKey: id.uuidString as NSString)
-            try? self.store.setLinkPreview(id, title: result.title, iconPNG: result.icon)
+            // A refresh that fails keeps the preview already shown.
+            let hadTitle = item.linkTitle?.isEmpty == false
+            if !(hadTitle && result.title.isEmpty) {
+                self.forgetLinkPreview(id)
+                try? self.store.setLinkPreview(id, title: result.title, iconPNG: result.icon, imageJPEG: result.image)
+            }
             if announce {
-                self.hud.show(result.title.isEmpty ? "未能获取链接标题" : "已获取链接标题",
+                self.hud.show(result.title.isEmpty ? "未能获取链接预览" : "已更新链接预览",
                               symbol: result.title.isEmpty ? "exclamationmark.triangle" : "link", duration: 1.6)
             }
             self.scheduleEnrichment()
@@ -482,9 +543,10 @@ final class AppController: NSObject, ObservableObject {
         linkFetches[id] = (token, task)
     }
 
-    /// Links skipped by the automatic rules (or whose fetch failed) can be fetched once on request.
+    /// Links skipped by the automatic rules (or whose fetch failed) can be fetched on request,
+    /// and fetched ones refreshed (links saved before 0.7 have no cover image yet).
     func canFetchLinkPreview(_ item: ClipItem) -> Bool {
-        linkPreviewEnabled && item.kind == .link && item.linkTitle?.isEmpty == true && item.detail != .sensitive
+        linkPreviewEnabled && item.kind == .link && item.linkTitle != nil && item.detail != .sensitive
             && linkFetches[item.id] == nil && LinkPreviewService.webURL(in: item) != nil
     }
 
@@ -527,10 +589,7 @@ final class AppController: NSObject, ObservableObject {
                 text = converted
             }
             var cursorBack = 0
-            // Snippets made in 轻贴 may contain variables; copied content is pasted verbatim.
-            if transform == nil, item.kind == .text, item.sourceBundleID == Bundle.main.bundleIdentifier,
-               let full = ClipboardMonitor.fullText(from: payload), SnippetExpander.hasVariables(full) {
-                let expanded = SnippetExpander.expand(full, clipboard: NSPasteboard.general.string(forType: .string))
+            if transform == nil, let expanded = expandedSnippet(item, payload: payload) {
                 text = expanded.text; cursorBack = expanded.cursorFromEnd
             }
             try pasteService.write(payload, plainText: text)
@@ -563,6 +622,68 @@ final class AppController: NSObject, ObservableObject {
                     self?.setStatus("已复制；未能切换到目标应用，请手动按 ⌘V。")
                 }
             }
+        } catch { present(error) }
+    }
+
+    /// Snippets made in 轻贴 may contain variables; copied content is pasted verbatim.
+    private func expandedSnippet(_ item: ClipItem, payload: [ClipboardEntry]) -> (text: String, cursorFromEnd: Int)? {
+        guard item.kind == .text, item.sourceBundleID == Bundle.main.bundleIdentifier,
+              let full = ClipboardMonitor.fullText(from: payload), SnippetExpander.hasVariables(full) else { return nil }
+        return SnippetExpander.expand(full, clipboard: NSPasteboard.general.string(forType: .string))
+    }
+
+    // MARK: Aliases
+
+    /// A card renamed to “;” plus letters, digits, “-” or “_” is an alias: typing it in another app
+    /// replaces it with the card. Only the characters after a “;” are kept, and only until they stop matching.
+    static func isAlias(_ title: String) -> Bool {
+        title.count >= 2 && title.count <= 32 && title.first == ";"
+            && title.dropFirst().allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+    }
+
+    private func aliasItem(_ typed: String) -> ClipItem? {
+        store.items.first { $0.title == typed && Self.isAlias($0.title) && $0.title != HistoryStore.automaticTitle($0.text) }
+    }
+
+    /// Global key monitors only receive events once Accessibility is granted, so this is retried as it changes.
+    private func installAliasMonitor() {
+        guard aliasMonitor == nil, accessibilityGranted else { return }
+        aliasMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            MainActor.assumeIsolated { self?.aliasKeyDown(event) }
+        }
+    }
+
+    private func aliasKeyDown(_ event: NSEvent) {
+        guard !PasteService.isSynthetic(event) else { return }
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+              let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { aliasTyped = nil; return }
+        let characters = event.characters ?? ""
+        if characters == ";" || characters == "；" { aliasTyped = (";", pid); return }
+        guard var typed = aliasTyped, typed.pid == pid else { aliasTyped = nil; return }
+        if event.keyCode == 51 {
+            typed.text.removeLast()
+            aliasTyped = typed.text.isEmpty ? nil : typed
+            return
+        }
+        guard characters.count == 1, let character = characters.first, character.isASCII,
+              character.isLetter || character.isNumber || character == "-" || character == "_",
+              typed.text.count < 32 else { aliasTyped = nil; return }
+        typed.text.append(character)
+        aliasTyped = typed
+        if let item = aliasItem(typed.text) { aliasTyped = nil; expandAlias(item, typedCount: typed.text.count) }
+    }
+
+    private func expandAlias(_ item: ClipItem, typedCount: Int) {
+        guard let target = NSWorkspace.shared.frontmostApplication,
+              target.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              !Self.bundleIDs(in: excludedAppsText).contains(target.bundleIdentifier ?? "") else { return }
+        do {
+            let payload = try store.payload(for: item.id)
+            let expanded = expandedSnippet(item, payload: payload)
+            try pasteService.write(payload, plainText: expanded?.text)
+            monitor.markOwnWrite()
+            pasteService.deleteBackward(typedCount)
+            pasteService.paste(into: target, cursorBack: expanded?.cursorFromEnd ?? 0) { _ in }
         } catch { present(error) }
     }
 
@@ -754,6 +875,7 @@ final class AppController: NSObject, ObservableObject {
         let field = NSTextField(string: item.title)
         field.frame = NSRect(x: 0, y: 0, width: 330, height: 24)
         let alert = NSAlert(); alert.messageText = "重命名内容"; alert.accessoryView = field
+        alert.informativeText = "名称以英文分号开头（如 ;gh）即成为别名：在其他应用输入它，会自动替换成这条内容。"
         alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -788,8 +910,7 @@ final class AppController: NSObject, ObservableObject {
             // A preview still loading for the old link must not be written back to the edited one.
             linkFetches.removeValue(forKey: id)?.task.cancel()
             images.removeObject(forKey: id.uuidString as NSString)
-            enrichmentAttempted.remove(id); missingLinkIcons.remove(id)
-            linkIcons.removeObject(forKey: id.uuidString as NSString)
+            enrichmentAttempted.remove(id); forgetLinkPreview(id)
             scheduleEnrichment()
             hud.show("已保存修改")
             return true
@@ -995,6 +1116,7 @@ final class AppController: NSObject, ObservableObject {
     func refreshPermissions() {
         let granted = AXIsProcessTrusted()
         if accessibilityGranted != granted { accessibilityGranted = granted }
+        installAliasMonitor()
     }
     func requestAccessibility() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -1020,8 +1142,9 @@ final class AppController: NSObject, ObservableObject {
     /// Registers a recorded shortcut; on conflict the previous one is restored and false is returned.
     @discardableResult
     func setHotKey(_ spec: HotKeySpec) -> Bool {
-        guard hotKeys.register(spec) else {
-            if let registeredHotKey { hotKeys.register(registeredHotKey) }
+        // Recording released both shortcuts; whatever happens, both are registered again afterwards.
+        defer { resumeHotKey() }
+        guard spec != quickHotKey, hotKeys.register(spec) else {
             setStatus("\(spec.label) 已被其他应用占用，请换一个组合。")
             return false
         }
@@ -1032,8 +1155,20 @@ final class AppController: NSObject, ObservableObject {
     }
 
     /// While recording, the current shortcut must not fire.
+    func setQuickHotKey(_ spec: HotKeySpec) -> Bool {
+        defer { resumeHotKey() }
+        guard spec != hotKey, hotKeys.register(spec, id: 2) else { return false }
+        registeredQuickHotKey = spec; quickHotKey = spec
+        defaults.set(Int(spec.keyCode), forKey: "quickHotKeyCode"); defaults.set(Int(spec.carbonModifiers), forKey: "quickHotKeyModifiers")
+        rebuildStatusMenu()
+        return true
+    }
+
     func suspendHotKey() { hotKeys.unregister() }
-    func resumeHotKey() { if let registeredHotKey { hotKeys.register(registeredHotKey) } }
+    func resumeHotKey() {
+        if let registeredHotKey { hotKeys.register(registeredHotKey) }
+        if let registeredQuickHotKey { hotKeys.register(registeredQuickHotKey, id: 2) }
+    }
 
     private func applySettings() {
         store.maximumItems = maxItems
@@ -1047,6 +1182,10 @@ final class AppController: NSObject, ObservableObject {
                 if let registeredHotKey { hotKeys.register(registeredHotKey); hotKey = registeredHotKey }
             }
         }
+        if registeredQuickHotKey != quickHotKey, quickHotKey != hotKey {
+            if hotKeys.register(quickHotKey, id: 2) { registeredQuickHotKey = quickHotKey }
+            else { setStatus("光标处粘贴的快捷键 \(quickHotKey.label) 已被占用，请在设置中录制其他组合。") }
+        }
         pruneHistory(); rebuildStatusMenu()
     }
 
@@ -1057,7 +1196,7 @@ final class AppController: NSObject, ObservableObject {
     /// Keeps the drawer and preview out of screen sharing, recordings and screenshots when asked.
     private func applySharingType() {
         let type: NSWindow.SharingType = hideDuringScreenShare ? .none : .readOnly
-        compactPanel?.sharingType = type; previewWindow?.sharingType = type
+        compactPanel?.sharingType = type; previewWindow?.sharingType = type; quickPanel?.sharingType = type
     }
 
     private func pruneHistory() {
@@ -1160,6 +1299,12 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func closeDrawer(animated: Bool, restoreFocus: Bool) {
+        if quickPanel?.isVisible == true {
+            quickPanel?.orderOut(nil)
+            if restoreFocus, compactPanel?.isVisible != true, let previousApplication, !previousApplication.isTerminated {
+                previousApplication.activate(options: [])
+            }
+        }
         guard let panel = compactPanel, panel.isVisible else { return }
         if isClosingDrawer {
             if !animated { drawerAnimationID += 1; panel.orderOut(nil); isClosingDrawer = false }
@@ -1183,6 +1328,106 @@ final class AppController: NSObject, ObservableObject {
                 guard let self, self.drawerAnimationID == token else { return }
                 panel?.orderOut(nil); self.isClosingDrawer = false
             }
+        }
+    }
+
+    // MARK: Quick paste at the cursor
+
+    func toggleQuickPaste() {
+        if quickPanel?.isVisible == true { closeDrawer(animated: false, restoreFocus: true) }
+        else { showQuickPaste() }
+    }
+
+    private func showQuickPaste() {
+        closeDrawer(animated: false, restoreFocus: false)
+        previewWindow?.orderOut(nil)
+        rememberTarget()
+        // Read the caret before 轻贴 takes focus; afterwards the target app reports no focused field.
+        let caret = previousApplication.flatMap { PasteService.caretRect(in: $0.processIdentifier) }
+        quick.query = ""
+        quick.refresh()
+        if quickPanel == nil { quickPanel = makeQuickPanel() }
+        guard let panel = quickPanel else { return }
+        panel.setFrame(quickPanelFrame(near: caret), display: false)
+        refreshPermissions()
+        activate(); panel.makeKeyAndOrderFront(nil)
+        // The SwiftUI field exists after the first layout pass.
+        DispatchQueue.main.async { [weak self, weak panel] in
+            guard let self, let panel, let root = panel.contentView, let field = self.editableField(in: root) else { return }
+            panel.makeFirstResponder(field)
+        }
+    }
+
+    private func makeQuickPanel() -> ClipboardWindow {
+        let size = QuickPasteView.size
+        let window = ClipboardWindow(contentRect: NSRect(origin: .zero, size: size),
+                                     styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        window.title = "轻贴 · 光标处粘贴"
+        window.level = .statusBar; window.isOpaque = false; window.backgroundColor = .clear
+        window.hasShadow = true; window.isReleasedWhenClosed = false; window.hidesOnDeactivate = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        effect.material = .popover; effect.blendingMode = .behindWindow; effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = DS.Radius.panel; effect.layer?.masksToBounds = true
+        let host = NSHostingView(rootView: QuickPasteView(controller: self, model: quick))
+        host.frame = effect.bounds; host.autoresizingMask = [.width, .height]
+        effect.addSubview(host)
+        window.contentView = effect
+        window.handleKey = { [weak self, weak window] event in self?.handleQuickKey(event, window: window) ?? false }
+        window.sharingType = hideDuringScreenShare ? .none : .readOnly
+        return window
+    }
+
+    /// Just below the caret (above it near the bottom of the screen); at the pointer when the caret is unknown.
+    private func quickPanelFrame(near caret: CGRect?) -> CGRect {
+        let size = QuickPasteView.size
+        let anchor = caret ?? CGRect(origin: NSEvent.mouseLocation, size: .zero)
+        let screen = NSScreen.screens.first { $0.frame.intersects(anchor.insetBy(dx: -1, dy: -1)) } ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? CGRect(origin: .zero, size: size)
+        var origin = CGPoint(x: anchor.minX - 14, y: anchor.minY - size.height - 6)
+        if origin.y < visible.minY { origin.y = anchor.maxY + 6 }
+        origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - size.width - 8)
+        origin.y = min(max(origin.y, visible.minY + 8), visible.maxY - size.height - 8)
+        return CGRect(origin: origin, size: size)
+    }
+
+    func pasteFromQuickPaste(_ id: UUID, plainText: Bool = false) {
+        guard store.items.contains(where: { $0.id == id }) else { NSSound.beep(); return }
+        selectedID = id
+        if !multiSelection.isEmpty { multiSelection = [] }
+        useSelected(plainText: plainText)
+    }
+
+    private func handleQuickKey(_ event: NSEvent, window: NSWindow?) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let numberKeys: [UInt16: Int] = [18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9]
+        if modifiers == .command || modifiers == [.command, .shift], let number = numberKeys[event.keyCode] {
+            let results = quick.results
+            guard results.indices.contains(number - 1) else { return true }
+            pasteFromQuickPaste(results[number - 1].id, plainText: modifiers.contains(.shift)); return true
+        }
+        guard modifiers.isEmpty || modifiers == .shift else { return false }
+        switch event.keyCode {
+        case 53:
+            if !quick.query.isEmpty { quick.query = "" } else { closeDrawer(animated: false, restoreFocus: true) }
+            return true
+        case 125, 126:
+            quick.move(by: event.keyCode == 125 ? 1 : -1); return true
+        case 36, 76:
+            guard let id = quick.selectedID else { NSSound.beep(); return true }
+            pasteFromQuickPaste(id, plainText: modifiers.contains(.shift)); return true
+        default:
+            // Typing always searches, even if the field has not taken focus yet.
+            let isEditing = (window?.firstResponder as? NSTextView)?.isEditable == true
+            if !isEditing, let characters = event.characters, !characters.isEmpty,
+               characters.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
+               let root = window?.contentView, let field = editableField(in: root) {
+                window?.makeFirstResponder(field)
+                (window?.firstResponder as? NSTextView)?.interpretKeyEvents([event])
+                return true
+            }
+            return false
         }
     }
 
@@ -1307,6 +1552,7 @@ final class AppController: NSObject, ObservableObject {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item)
         }
         add("打开抽屉  \(shortcutLabel)", #selector(menuShowPanel))
+        add("光标处粘贴  \(quickHotKey.label)", #selector(menuQuickPaste))
         add("新建常用文本…", #selector(menuNewText))
         menu.addItem(.separator())
         if capturePaused { add("继续记录", #selector(menuPause)) }
@@ -1328,6 +1574,7 @@ final class AppController: NSObject, ObservableObject {
         } else { togglePanel() }
     }
     @objc private func menuShowPanel() { showPanel() }
+    @objc private func menuQuickPaste() { showQuickPaste() }
     @objc private func menuNewText() { showPanel(); createTextItem() }
     @objc private func menuPause() { togglePause() }
     @objc private func menuPauseFor(_ sender: NSMenuItem) {

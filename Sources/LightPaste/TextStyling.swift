@@ -69,12 +69,20 @@ enum SyntaxHighlighter {
         ]
         return patterns.compactMap { pattern, color in (try? NSRegularExpression(pattern: pattern)).map { ($0, color) } }
     }()
+    /// Fixed colors for the always-dark code panel on cards.
+    private static let darkRules: [(NSRegularExpression, Color)] = {
+        let colors = [Color(red: 0.93, green: 0.55, blue: 0.85), Color(red: 0.55, green: 0.72, blue: 1.0),
+                      Color(red: 0.98, green: 0.66, blue: 0.48), Color(red: 0.50, green: 0.55, blue: 0.52)]
+        return zip(rules, colors).map { ($0.0, $1) }
+    }()
+    static let darkText = Color(white: 0.88)
 
     /// Later rules win, so strings and comments override keywords inside them.
-    static func attributed(_ code: String) -> AttributedString {
+    static func attributed(_ code: String, dark: Bool = false) -> AttributedString {
         var result = AttributedString(code)
+        if dark { result.foregroundColor = darkText }
         let range = NSRange(code.startIndex..., in: code)
-        for (expression, color) in rules {
+        for (expression, color) in dark ? darkRules : rules {
             for match in expression.matches(in: code, range: range) {
                 guard let r = Range(match.range, in: code),
                       let lower = AttributedString.Index(r.lowerBound, within: result),

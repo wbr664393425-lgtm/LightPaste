@@ -7,34 +7,46 @@ final class DrawerHostingView<Content: View>: NSHostingView<Content> {
     override var acceptsFirstResponder: Bool { true }
 }
 
+/// Global shortcuts by identifier: 1 opens the drawer, 2 opens quick paste at the cursor.
 final class HotKeyManager {
-    private var reference: EventHotKeyRef?
+    private var references: [UInt32: EventHotKeyRef] = [:]
     private var handler: EventHandlerRef?
-    var onTrigger: (() -> Void)?
+    var onTrigger: ((UInt32) -> Void)?
 
     init() {
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
-            guard let context else { return OSStatus(eventNotHandledErr) }
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
+            guard let context, let event else { return OSStatus(eventNotHandledErr) }
+            var identifier = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &identifier)
             let owner = Unmanaged<HotKeyManager>.fromOpaque(context).takeUnretainedValue()
-            DispatchQueue.main.async { owner.onTrigger?() }
+            let id = identifier.id
+            DispatchQueue.main.async { owner.onTrigger?(id) }
             return noErr
         }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), &handler)
     }
 
     @discardableResult
-    func register(_ spec: HotKeySpec) -> Bool {
-        unregister()
-        let identifier = EventHotKeyID(signature: OSType(0x4c505354), id: 1)
-        return RegisterEventHotKey(spec.keyCode, spec.carbonModifiers, identifier, GetApplicationEventTarget(), 0, &reference) == noErr
+    func register(_ spec: HotKeySpec, id: UInt32 = 1) -> Bool {
+        unregister(id: id)
+        let identifier = EventHotKeyID(signature: OSType(0x4c505354), id: id)
+        var reference: EventHotKeyRef?
+        guard RegisterEventHotKey(spec.keyCode, spec.carbonModifiers, identifier, GetApplicationEventTarget(), 0, &reference) == noErr,
+              let reference else { return false }
+        references[id] = reference
+        return true
     }
 
-    func unregister() {
-        if let reference { UnregisterEventHotKey(reference); self.reference = nil }
+    /// Without an identifier, every shortcut is released (while recording a new one).
+    func unregister(id: UInt32? = nil) {
+        for (key, reference) in references where id == nil || key == id {
+            UnregisterEventHotKey(reference); references[key] = nil
+        }
     }
 
     deinit {
-        if let reference { UnregisterEventHotKey(reference) }
+        references.values.forEach { UnregisterEventHotKey($0) }
         if let handler { RemoveEventHandler(handler) }
     }
 }
@@ -45,6 +57,7 @@ struct HotKeySpec: Equatable {
     var carbonModifiers: UInt32
 
     static let `default` = HotKeySpec(keyCode: 49, carbonModifiers: UInt32(optionKey))
+    static let quickDefault = HotKeySpec(keyCode: 49, carbonModifiers: UInt32(optionKey | shiftKey))
 
     /// The three presets offered before 0.4.
     static func legacy(option: Int) -> HotKeySpec {
@@ -168,6 +181,55 @@ final class PasteService {
         if AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &settable) == .success,
            settable.boolValue { return true }
         return false
+    }
+
+    /// Where the target app's text caret is, in AppKit screen coordinates. nil without Accessibility
+    /// or when the app does not report it (the caller then uses the pointer).
+    static func caretRect(in pid: pid_t) -> CGRect? {
+        guard AXIsProcessTrusted() else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.25)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
+        let element = focused as! AXUIElement
+        var found: CGRect?
+        var range: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &range) == .success, let range {
+            var bounds: CFTypeRef?
+            if AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString, range, &bounds) == .success,
+               let bounds, CFGetTypeID(bounds) == AXValueGetTypeID() {
+                var rect = CGRect.zero
+                if AXValueGetValue(bounds as! AXValue, .cgRect, &rect), rect.height > 0, rect.origin != .zero { found = rect }
+            }
+        }
+        // No caret bounds: a single-line field's own frame still says where the user is typing.
+        if found == nil {
+            var position: CFTypeRef?, size: CFTypeRef?
+            var origin = CGPoint.zero, extent = CGSize.zero
+            if AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &position) == .success,
+               AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &size) == .success,
+               let position, let size,
+               AXValueGetValue(position as! AXValue, .cgPoint, &origin), AXValueGetValue(size as! AXValue, .cgSize, &extent),
+               extent.height > 0, extent.height <= 80 {
+                found = CGRect(origin: origin, size: CGSize(width: min(extent.width, 2), height: extent.height))
+            }
+        }
+        // Accessibility measures from the top of the primary screen; AppKit from its bottom.
+        guard let rect = found, let primary = NSScreen.screens.first else { return nil }
+        return CGRect(x: rect.minX, y: primary.frame.maxY - rect.maxY, width: rect.width, height: rect.height)
+    }
+
+    /// Erases what was just typed (an alias) in the frontmost app with synthetic Delete keys.
+    func deleteBackward(_ count: Int) {
+        guard AXIsProcessTrusted(), let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        for _ in 0..<min(count, 64) {
+            for isDown in [true, false] {
+                guard let key = CGEvent(keyboardEventSource: source, virtualKey: 51, keyDown: isDown) else { continue }
+                key.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
+                key.post(tap: .cgSessionEventTap)
+            }
+        }
     }
 
     /// Sends ⌘V to the target, then optionally moves the caret left for a snippet's {光标} marker.

@@ -145,18 +145,15 @@ struct DrawerView: View {
                 Button("清除筛选") { controller.clearNarrowingFilters() }
             }
         } label: {
-            HStack(spacing: 5) {
-                if controller.hasNarrowingFilters {
-                    Image(systemName: "line.3.horizontal.decrease.circle.fill").font(.ds(DS.Size.body))
-                }
-                Text(filterSummary).font(.ds(DS.Size.body)).lineLimit(1)
-                Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
-            }
-            .foregroundStyle(controller.hasNarrowingFilters ? DS.accent : DS.secondary)
-            .frame(maxWidth: 200)
+            // A borderless menu keeps only an icon and a title from its label and colors them with the tint.
+            Label(filterSummary, systemImage: controller.hasNarrowingFilters
+                  ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease")
+                .font(.ds(DS.Size.body))
         }
         .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .menuIndicator(.visible)
+        .tint(controller.hasNarrowingFilters ? DS.accent : DS.secondary)
+        .frame(maxWidth: 200)
         .fixedSize()
         .accessibilityLabel("筛选：\(filterSummary)")
         .help("按类型、来源应用和日期筛选")
@@ -287,7 +284,7 @@ struct DrawerView: View {
                          ? (controller.alwaysPlainText || controller.targetPastesPlainText ? "粘贴纯文本" : "粘贴") : "复制")
                     hint("⌘1–9", "快速粘贴")
                     hint("空格", "预览")
-                    hint("⌘ 点击", "多选")
+                    hint("⌘", "点击多选")
                 }
                 Spacer(minLength: DS.Space.xs)
                 if !controller.statusText.isEmpty {
@@ -308,7 +305,7 @@ struct DrawerView: View {
 
     private func hint(_ key: String, _ label: String) -> some View {
         HStack(spacing: 5) {
-            Text(key).font(.ds(DS.Size.caption, .semibold))
+            KeyCap(text: key)
             Text(label).font(.ds(DS.Size.caption))
         }
         .foregroundStyle(DS.secondary)
@@ -456,6 +453,8 @@ struct DrawerClipCard: View, Equatable {
     let size: CardSize
     let pasting: Bool
     let onSelect: () -> Void
+    /// Off in the quick-paste preview, where clicks belong to the list.
+    var interactive = true
     @State private var thumbnail: NSImage?
     @State private var thumbnailFinished = false
     @State private var fileThumbnail: NSImage?
@@ -477,14 +476,12 @@ struct DrawerClipCard: View, Equatable {
     var body: some View {
         VStack(spacing: 0) {
             header
-            content
-                .padding(.horizontal, 14).padding(.top, DS.Space.m)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .clipped()
+            contentArea
             footer
         }
         .frame(width: size.width, height: size.height)
-        .background(highlighted ? DS.selected.opacity(0.55) : .clear)
+        // A wash marks group members; a single selection keeps its body plain under the border.
+        .background(inMultiSelection ? DS.selected.opacity(0.55) : .clear)
         .background(DS.surface)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
         .overlay(RoundedRectangle(cornerRadius: DS.Radius.card)
@@ -496,7 +493,7 @@ struct DrawerClipCard: View, Equatable {
         .animation(reduceMotion ? nil : .easeIn(duration: 0.14), value: pasting)
         .contentShape(RoundedRectangle(cornerRadius: DS.Radius.card))
         .onHover { hovering = $0 }
-        .overlay(NativeCardInteraction(controller: controller, item: item, onSelect: onSelect))
+        .overlay(interaction)
         .task(id: item.id) {
             if item.kind == .image {
                 let loaded = await controller.thumbnail(for: item)
@@ -518,6 +515,10 @@ struct DrawerClipCard: View, Equatable {
         .accessibilityAction(named: "粘贴") { controller.select(item.id); controller.useSelected() }
         .accessibilityAction(named: "预览") { controller.select(item.id); controller.showItemPreview() }
         .accessibilityAction(named: inMultiSelection ? "移出多选" : "加入多选") { controller.toggleMultiSelect(item.id) }
+    }
+
+    @ViewBuilder private var interaction: some View {
+        if interactive { NativeCardInteraction(controller: controller, item: item, onSelect: onSelect) }
     }
 
     // MARK: Header and footer
@@ -558,16 +559,19 @@ struct DrawerClipCard: View, Equatable {
         .background(headerTint)
     }
 
-    /// The source app's color, softened; detected content and gray icons fall back to the kind color.
+    /// A faint wash of the source app's color: the icon carries identity, so a row of cards stays calm.
+    /// Only time-limited content (codes, secrets) keeps a warm header as a signal.
     private var headerTint: some View {
         ZStack {
-            if let detail = item.detail, detail == .sensitive || detail == .otp || detail == .code {
+            if let detail = item.detail, detail == .sensitive || detail == .otp {
                 DS.tint(for: detail)
-            } else if let tint = controller.icons.tint(bundleID: item.sourceBundleID) {
-                DS.surface
-                Color(nsColor: tint).opacity(0.26)
             } else {
-                DS.tint(for: item.kind)
+                DS.surface
+                if let tint = controller.icons.tint(bundleID: item.sourceBundleID) {
+                    Color(nsColor: tint).opacity(0.1)
+                } else {
+                    DS.ink.opacity(0.035)
+                }
             }
         }
     }
@@ -596,6 +600,27 @@ struct DrawerClipCard: View, Equatable {
     }
 
     // MARK: Content
+
+    /// Covers, images, colors and code fill the card edge to edge; everything else keeps the text margins.
+    private var fullBleed: Bool {
+        if let detail = item.detail { return detail == .color || detail == .code }
+        return item.kind == .link || (item.kind == .image && thumbnail != nil)
+    }
+
+    @ViewBuilder private var contentArea: some View {
+        if fullBleed {
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .clipped()
+        } else {
+            content
+                .padding(.horizontal, 14).padding(.top, DS.Space.m)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .clipped()
+        }
+    }
+
+    private var zoomed: Bool { hovering && !reduceMotion }
 
     @ViewBuilder private var content: some View {
         if let detail = item.detail {
@@ -642,26 +667,41 @@ struct DrawerClipCard: View, Equatable {
                 Text(bodyText).font(.ds(DS.Size.caption)).foregroundStyle(DS.secondary).lineLimit(3)
             }
         case .color:
-            let rgba = ContentDetector.color(in: bodyText.trimmingCharacters(in: .whitespacesAndNewlines))
-            VStack(alignment: .leading, spacing: DS.Space.s) {
-                RoundedRectangle(cornerRadius: DS.Radius.small)
-                    .fill(Color(.sRGB, red: rgba?.red ?? 0, green: rgba?.green ?? 0, blue: rgba?.blue ?? 0, opacity: rgba?.alpha ?? 1))
-                    .overlay(RoundedRectangle(cornerRadius: DS.Radius.small).strokeBorder(DS.line))
-                    .frame(maxWidth: .infinity).frame(height: size.height * 0.36)
-                Text(bodyText).font(.system(size: DS.Size.title, weight: .semibold, design: .monospaced)).lineLimit(1)
+            let value = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rgba = ContentDetector.color(in: value)
+            let (r, g, b, a) = (rgba?.red ?? 0, rgba?.green ?? 0, rgba?.blue ?? 0, rgba?.alpha ?? 1)
+            // Dark ink on light swatches, white on dark ones; translucent colors sit on the card surface.
+            let light = (0.299 * r + 0.587 * g + 0.114 * b) * a + (1 - a) * 0.9 > 0.6
+            ZStack(alignment: .bottomLeading) {
+                Color(.sRGB, red: r, green: g, blue: b, opacity: a)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(value).font(.system(size: DS.Size.display, weight: .semibold, design: .monospaced))
+                        .lineLimit(1).minimumScaleFactor(0.6)
+                    Text(String(format: "RGB %d, %d, %d", Int(r * 255), Int(g * 255), Int(b * 255)) + (a < 1 ? String(format: " · %.0f%%", a * 100) : ""))
+                        .font(.system(size: DS.Size.caption, design: .monospaced)).opacity(0.75)
+                }
+                .foregroundStyle(light ? Color.black.opacity(0.78) : Color.white)
+                .padding(14)
             }
         case .code:
             let code = keywords.isEmpty ? String(bodyText.prefix(800)) : SearchHighlight.excerpt(bodyText, keywords: keywords, limit: 800)
-            VStack(alignment: .leading, spacing: 6) {
-                Text(CodeLanguageCache.label(for: item.id, text: bodyText))
-                    .font(.system(size: 10, weight: .semibold)).foregroundStyle(DS.secondary)
-                    .padding(.horizontal, 5).frame(height: 16).background(DS.ink.opacity(0.06), in: Capsule())
-                Text(keywords.isEmpty ? SyntaxHighlighter.attributed(code)
-                     : SearchHighlight.attributed(code, keywords: keywords, base: SyntaxHighlighter.attributed(code)))
+            // An editor-like dark panel in both appearances, so code reads as code at a glance.
+            VStack(alignment: .leading, spacing: DS.Space.s) {
+                HStack(spacing: 5) {
+                    ForEach(0..<3, id: \.self) { _ in Circle().fill(Color.white.opacity(0.18)).frame(width: 7, height: 7) }
+                    Spacer(minLength: 0)
+                    Text(CodeLanguageCache.label(for: item.id, text: bodyText))
+                        .font(.system(size: 10, weight: .semibold)).foregroundStyle(Color.white.opacity(0.55))
+                }
+                Text(keywords.isEmpty ? SyntaxHighlighter.attributed(code, dark: true)
+                     : SearchHighlight.attributed(code, keywords: keywords, base: SyntaxHighlighter.attributed(code, dark: true)))
                     .font(.system(size: DS.Size.caption, design: .monospaced)).lineSpacing(2)
                     .lineLimit(size == .compact ? 6 : 8)
                     .frame(maxWidth: .infinity, alignment: .topLeading)
             }
+            .padding(.horizontal, 14).padding(.vertical, DS.Space.m)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(Color(red: 0.12, green: 0.13, blue: 0.15))
         case .email, .phone:
             VStack(alignment: .leading, spacing: DS.Space.s) {
                 Image(systemName: detail.symbol).font(.system(size: 22, weight: .light)).foregroundStyle(DS.accent)
@@ -674,12 +714,29 @@ struct DrawerClipCard: View, Equatable {
     @ViewBuilder private var kindContent: some View {
         switch item.kind {
         case .image:
-            VStack(alignment: .leading, spacing: 7) {
-                if let thumbnail {
-                    Image(nsImage: thumbnail).resizable().scaledToFit()
-                        .frame(maxWidth: .infinity, maxHeight: size.height - 110)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                } else {
+            if let thumbnail {
+                ZStack(alignment: .bottomLeading) {
+                    Color.clear.overlay(
+                        Image(nsImage: thumbnail).resizable().interpolation(.high).scaledToFill()
+                            .scaleEffect(zoomed ? 1.05 : 1)
+                            .animation(.easeOut(duration: 0.25), value: zoomed)
+                    )
+                    .clipped()
+                    Group {
+                        if !keywords.isEmpty, let ocr = item.ocrText, !ocr.isEmpty {
+                            highlightedText(SearchHighlight.excerpt(ocr, keywords: keywords, limit: 120), limit: 120)
+                        } else {
+                            Text(item.title)
+                        }
+                    }
+                    .font(.ds(DS.Size.caption, .medium)).lineLimit(1)
+                    .padding(.horizontal, DS.Space.s).frame(height: 22)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(DS.Space.s)
+                }
+                .background(DS.ink.opacity(0.04))
+            } else {
+                VStack(alignment: .leading, spacing: 7) {
                     VStack(spacing: DS.Space.s) {
                         if thumbnailFinished {
                             Image(systemName: "photo").font(.system(size: 24, weight: .light))
@@ -690,25 +747,23 @@ struct DrawerClipCard: View, Equatable {
                     }
                     .foregroundStyle(DS.secondary)
                     .frame(maxWidth: .infinity).frame(height: size.height - 110)
-                }
-                if !keywords.isEmpty, let ocr = item.ocrText, !ocr.isEmpty {
-                    highlightedText(SearchHighlight.excerpt(ocr, keywords: keywords, limit: 120), limit: 120)
-                        .font(.ds(DS.Size.caption)).lineLimit(1)
-                } else {
                     Text(item.title).font(.ds(DS.Size.caption)).foregroundStyle(DS.secondary).lineLimit(1)
                 }
             }
         case .link:
-            VStack(alignment: .leading, spacing: DS.Space.s) {
-                HStack(spacing: DS.Space.s) {
-                    linkIcon
-                    Text(linkHost ?? "链接").font(.ds(DS.Size.caption, .medium)).foregroundStyle(DS.secondary).lineLimit(1)
+            VStack(alignment: .leading, spacing: 0) {
+                linkHero.frame(height: (size.height * 0.42).rounded())
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    highlightedText(linkHeadline, limit: 200)
+                        .font(.ds(DS.Size.title, .semibold)).lineLimit(size == .compact ? 1 : 2).lineSpacing(2)
+                    // The hero already names the site; this line adds only the page within it.
+                    if let linkDetail {
+                        highlightedText(linkDetail, limit: 400)
+                            .font(.ds(DS.Size.caption)).foregroundStyle(DS.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
                 }
-                highlightedText(linkHeadline, limit: 200)
-                    .font(.ds(DS.Size.title, .semibold)).lineLimit(3).lineSpacing(2)
-                highlightedText(item.text.isEmpty ? item.title : item.text, limit: 400)
-                    .font(.ds(DS.Size.caption)).foregroundStyle(DS.secondary).lineSpacing(3)
-                    .lineLimit(size == .compact ? 1 : 2)
+                .padding(.horizontal, 14).padding(.top, 10)
             }
         case .files:
             VStack(alignment: .leading, spacing: DS.Space.s) {
@@ -728,6 +783,13 @@ struct DrawerClipCard: View, Equatable {
                     }
                 }
             }
+        case .text where keywords.isEmpty && isShortText:
+            // A word or a short phrase reads as a headline instead of a lone line in the corner.
+            let phrase = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
+            Text(phrase)
+                .font(.system(size: phrase.count <= 8 ? 28 : DS.Size.display + 2, weight: .semibold))
+                .lineLimit(3).minimumScaleFactor(0.7).lineSpacing(2)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
         case .text:
             highlightedText(keywords.isEmpty ? String(bodyText.prefix(600)) : SearchHighlight.excerpt(bodyText, keywords: keywords), limit: 600)
                 .font(.ds(DS.Size.emphasis)).lineSpacing(4)
@@ -748,16 +810,84 @@ struct DrawerClipCard: View, Equatable {
         return keywords.isEmpty ? Text(clipped) : Text(SearchHighlight.attributed(clipped, keywords: keywords))
     }
 
-    @ViewBuilder private var linkIcon: some View {
-        if let icon = controller.linkIcon(for: item) {
-            Image(nsImage: icon).resizable().interpolation(.high).frame(width: 18, height: 18)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-        } else {
-            Text(String((linkHost ?? "?").prefix(1)).uppercased())
-                .font(.system(size: 11, weight: .bold)).foregroundStyle(DS.background)
-                .frame(width: 18, height: 18)
-                .background(DS.accent.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
+    private func linkIcon(side: CGFloat) -> some View {
+        Group {
+            if let icon = controller.linkIcon(for: item) {
+                Image(nsImage: icon).resizable().interpolation(.high)
+            } else {
+                Text(String((linkHost ?? "?").prefix(1)).uppercased())
+                    .font(.system(size: side * 0.6, weight: .bold)).foregroundStyle(Color.white)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(linkColor)
+            }
         }
+        .frame(width: side, height: side)
+        .clipShape(RoundedRectangle(cornerRadius: side * 0.22, style: .continuous))
+    }
+
+    private var linkColor: Color {
+        controller.linkTint(for: item).map { Color(nsColor: $0) } ?? Color(red: 0.26, green: 0.52, blue: 0.92)
+    }
+
+    /// The page's cover when it has one; otherwise the site's color with its icon, large and small.
+    @ViewBuilder private var linkHero: some View {
+        if let cover = controller.linkImage(for: item) {
+            Color.clear
+                .overlay(Image(nsImage: cover).resizable().interpolation(.high).scaledToFill()
+                    .scaleEffect(zoomed ? 1.06 : 1)
+                    .animation(.easeOut(duration: 0.3), value: zoomed))
+                .clipped()
+                .overlay(alignment: .bottomLeading) {
+                    HStack(spacing: 5) {
+                        linkIcon(side: 14)
+                        Text(linkHost ?? "链接").font(.ds(DS.Size.caption, .medium)).lineLimit(1)
+                    }
+                    .padding(.horizontal, 7).frame(height: 22)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(DS.Space.s)
+                }
+        } else {
+            ZStack(alignment: .leading) {
+                LinearGradient(colors: [linkColor.opacity(0.42), linkColor.opacity(0.14)],
+                               startPoint: .topLeading, endPoint: .bottomTrailing)
+                linkIcon(side: 76)
+                    .opacity(0.18).blur(radius: 1.5)
+                    .rotationEffect(.degrees(zoomed ? -4 : -12))
+                    .offset(x: size.width - 70, y: 14)
+                    .animation(.spring(response: 0.4, dampingFraction: 0.7), value: zoomed)
+                HStack(spacing: 10) {
+                    linkIcon(side: 34).shadow(color: .black.opacity(0.15), radius: 3, y: 1)
+                    Text(linkHost ?? "链接").font(.ds(DS.Size.emphasis, .semibold)).foregroundStyle(DS.ink.opacity(0.85))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 14)
+            }
+            .clipped()
+        }
+    }
+
+    /// The path and query under the title, or the full address while searching so matches in the host show.
+    private var linkDetail: String? {
+        var detail = linkAddress
+        if keywords.isEmpty, let url = LinkPreviewService.webURL(in: item) {
+            detail = url.path + (url.query.map { "?" + $0 } ?? "")
+        }
+        let trimmed = detail.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return trimmed.isEmpty || trimmed == linkHeadline ? nil : detail
+    }
+
+    /// The address without its scheme, for the line under the title.
+    private var linkAddress: String {
+        let raw = (item.text.isEmpty ? item.title : item.text).trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["https://", "http://"] where raw.lowercased().hasPrefix(prefix) { return String(raw.dropFirst(prefix.count)) }
+        return raw
+    }
+
+    private var isShortText: Bool {
+        let text = bodyText
+        guard text.utf16.count <= 60 else { return false }
+        let phrase = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !phrase.isEmpty && phrase.count <= 24 && !phrase.contains(where: \.isNewline)
     }
 
     private var linkHeadline: String {

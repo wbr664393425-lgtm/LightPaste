@@ -3,12 +3,15 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${LIGHTPASTE_BUILD_DIR:-$PROJECT_DIR/.build}"
 APP_DIR="$PROJECT_DIR/轻贴.app"
-APP_VERSION="0.6.0"
-APP_BUILD="6"
+APP_VERSION="0.7.0"
+APP_BUILD="7"
 # Distribution signing (optional). Without these the app is ad-hoc signed for this Mac only.
 #   LIGHTPASTE_SIGN_IDENTITY  e.g. "Developer ID Application: Name (TEAMID)"
 #   LIGHTPASTE_NOTARY_PROFILE a profile saved with: xcrun notarytool store-credentials <profile>
 SIGN_IDENTITY="${LIGHTPASTE_SIGN_IDENTITY:-}"
+# Self-signed identity from Scripts/MakeLocalSigningIdentity.sh; used when present instead of ad-hoc,
+# so this Mac keeps the Accessibility permission across rebuilds.
+LOCAL_IDENTITY="${LIGHTPASTE_LOCAL_IDENTITY:-LightPaste Local Signing}"
 NOTARY_PROFILE="${LIGHTPASTE_NOTARY_PROFILE:-}"
 if [[ -n "$NOTARY_PROFILE" && -z "$SIGN_IDENTITY" ]]; then
   print -u2 "公证需要 Developer ID 签名：请同时设置 LIGHTPASTE_SIGN_IDENTITY。"
@@ -58,8 +61,13 @@ if [[ -f "$PROJECT_DIR/Scripts/MakeIcon.swift" ]]; then
   python3 "$PROJECT_DIR/Scripts/PackIcon.py" "$BUILD_DIR/AppIcon.iconset" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
-  /usr/bin/codesign --force --sign - --identifier com.local.lightpaste "$APP_DIR"
-  print "已生成：$APP_DIR（$APP_VERSION，本机临时签名）"
+  if security find-certificate -c "$LOCAL_IDENTITY" >/dev/null 2>&1; then
+    /usr/bin/codesign --force --sign "$LOCAL_IDENTITY" --identifier com.local.lightpaste "$APP_DIR"
+    print "已生成：$APP_DIR（$APP_VERSION，本机固定签名 $LOCAL_IDENTITY，重新构建后辅助功能授权保留）"
+  else
+    /usr/bin/codesign --force --sign - --identifier com.local.lightpaste "$APP_DIR"
+    print "已生成：$APP_DIR（$APP_VERSION，本机临时签名；运行 Scripts/MakeLocalSigningIdentity.sh 可保留授权）"
+  fi
   exit 0
 fi
 

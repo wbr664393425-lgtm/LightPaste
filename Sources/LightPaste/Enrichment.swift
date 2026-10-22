@@ -19,7 +19,8 @@ enum OCRService {
     }
 }
 
-/// Fetches a page title and icon for a copied link. Only the link's own host is contacted.
+/// Fetches a page title, icon and cover image for a copied link. The page is loaded from the link's own
+/// host; the icon and cover image come from wherever the page points to (often a CDN).
 enum LinkPreviewService {
     static func webURL(in item: ClipItem) -> URL? {
         let candidates = (item.text.prefix(2048).split(whereSeparator: \.isWhitespace).prefix(12).map(String.init)) + [item.title]
@@ -75,17 +76,18 @@ enum LinkPreviewService {
     }
 
     @MainActor
-    static func fetch(_ url: URL) async -> (title: String, icon: Data?) {
+    static func fetch(_ url: URL) async -> (title: String, icon: Data?, image: Data?) {
         let provider = LPMetadataProvider()
         provider.timeout = 8
-        provider.shouldFetchSubresources = false
+        // Without subresources the metadata carries no icon or cover image providers.
+        provider.shouldFetchSubresources = true
         // Cancelling the task (setting turned off, app quitting) stops the network request too.
         let fetched = await withTaskCancellationHandler {
             try? await provider.startFetchingMetadata(for: url)
         } onCancel: {
             provider.cancel()
         }
-        guard let metadata = fetched, !Task.isCancelled else { return ("", nil) }
+        guard let metadata = fetched, !Task.isCancelled else { return ("", nil, nil) }
         let title = (metadata.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         var icon: Data?
         if let iconProvider = metadata.iconProvider, iconProvider.canLoadObject(ofClass: NSImage.self) {
@@ -94,7 +96,32 @@ enum LinkPreviewService {
             }
             icon = image.flatMap { pngData($0, side: 64) }
         }
-        return (String(title.prefix(200)), icon)
+        var cover: Data?
+        if let imageProvider = metadata.imageProvider, imageProvider.canLoadObject(ofClass: NSImage.self) {
+            let image: NSImage? = await withCheckedContinuation { continuation in
+                imageProvider.loadObject(ofClass: NSImage.self) { object, _ in continuation.resume(returning: object as? NSImage) }
+            }
+            cover = image.flatMap { jpegData($0, maxWidth: 640) }
+        }
+        return (String(title.prefix(200)), icon, cover)
+    }
+
+    /// A card-sized JPEG of the page's cover image; tiny images (tracking pixels, spacers) are dropped.
+    static func jpegData(_ image: NSImage, maxWidth: CGFloat) -> Data? {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil), cg.width >= 120, cg.height >= 60 else { return nil }
+        let scale = min(1, maxWidth / CGFloat(cg.width))
+        let width = Int(CGFloat(cg.width) * scale), height = Int(CGFloat(cg.height) * scale)
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8,
+                                         samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current?.imageInterpolation = .high
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: width, height: height).fill()
+        NSGraphicsContext.current?.cgContext.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8])
     }
 
     static func pngData(_ image: NSImage, side: CGFloat) -> Data? {
@@ -137,9 +164,15 @@ final class IconProvider {
     func tint(bundleID: String?) -> NSColor? {
         guard let bundleID else { return nil }
         if let cached = tints[bundleID] { return cached }
+        let color = appIcon(bundleID: bundleID).flatMap(Self.averageColor)
+        tints[bundleID] = color
+        return color
+    }
+
+    /// Saturation-weighted average color of an image, or nil when it is mostly gray.
+    static func averageColor(of icon: NSImage) -> NSColor? {
         var color: NSColor?
-        if let icon = appIcon(bundleID: bundleID),
-           let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 12, pixelsHigh: 12, bitsPerSample: 8, samplesPerPixel: 4,
+        if let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 12, pixelsHigh: 12, bitsPerSample: 8, samplesPerPixel: 4,
                                       hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) {
             NSGraphicsContext.saveGraphicsState()
             NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
@@ -157,7 +190,6 @@ final class IconProvider {
                 if average.saturationComponent > 0.18 { color = average }
             }
         }
-        tints[bundleID] = color
         return color
     }
 

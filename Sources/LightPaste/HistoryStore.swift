@@ -117,6 +117,13 @@ final class HistoryStore: ObservableObject {
                         png BLOB NOT NULL
                     )
                     """)
+                // 0.7: link cover images.
+                try execute("""
+                    CREATE TABLE IF NOT EXISTS link_images (
+                        clip_id TEXT PRIMARY KEY NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                        jpeg BLOB NOT NULL
+                    )
+                    """)
             }
             // Folding every row's text was most of launch time; it now runs in the background.
             publishItems(try loadMetadata(), deferIndexing: true)
@@ -335,6 +342,7 @@ final class HistoryStore: ObservableObject {
                           updated.linkTitle.map(SQLValue.text) ?? .null, .text(id.uuidString)])
                 if updated.linkTitle == nil && old.linkTitle != nil {
                     try execute("DELETE FROM link_icons WHERE clip_id = ?", [.text(id.uuidString)])
+                    try execute("DELETE FROM link_images WHERE clip_id = ?", [.text(id.uuidString)])
                 }
             }
             var next = items
@@ -377,6 +385,9 @@ final class HistoryStore: ObservableObject {
                           copy.ocrText.map(SQLValue.text) ?? .null, copy.linkTitle.map(SQLValue.text) ?? .null])
                 if let icon = linkIcon(for: id) {
                     try execute("INSERT OR REPLACE INTO link_icons (clip_id, png) VALUES (?, ?)", [.text(copy.id.uuidString), .data(icon)])
+                }
+                if let image = linkImage(for: id) {
+                    try execute("INSERT OR REPLACE INTO link_images (clip_id, jpeg) VALUES (?, ?)", [.text(copy.id.uuidString), .data(image)])
                 }
             }
             var next = items
@@ -529,14 +540,17 @@ final class HistoryStore: ObservableObject {
         }
     }
 
-    /// Stores a fetched page title and icon; an empty title records a failed fetch so it is not retried.
-    func setLinkPreview(_ id: UUID, title: String, iconPNG: Data?) throws {
+    /// Stores a fetched page title, icon and cover; an empty title records a failed fetch so it is not retried.
+    func setLinkPreview(_ id: UUID, title: String, iconPNG: Data?, imageJPEG: Data? = nil) throws {
         try reportingErrors {
             guard let index = items.firstIndex(where: { $0.id == id }) else { return }
             try transaction {
                 try execute("UPDATE clips SET link_title = ? WHERE id = ?", [.text(title), .text(id.uuidString)])
                 if let iconPNG {
                     try execute("INSERT OR REPLACE INTO link_icons (clip_id, png) VALUES (?, ?)", [.text(id.uuidString), .data(iconPNG)])
+                }
+                if let imageJPEG {
+                    try execute("INSERT OR REPLACE INTO link_images (clip_id, jpeg) VALUES (?, ?)", [.text(id.uuidString), .data(imageJPEG)])
                 }
             }
             var next = items
@@ -673,8 +687,11 @@ final class HistoryStore: ObservableObject {
         return Data(bytes: bytes, count: size)
     }
 
-    func linkIcon(for id: UUID) -> Data? {
-        guard let statement = try? prepare("SELECT png FROM link_icons WHERE clip_id = ?", [.text(id.uuidString)]) else { return nil }
+    func linkIcon(for id: UUID) -> Data? { blob("SELECT png FROM link_icons WHERE clip_id = ?", id) }
+    func linkImage(for id: UUID) -> Data? { blob("SELECT jpeg FROM link_images WHERE clip_id = ?", id) }
+
+    private func blob(_ sql: String, _ id: UUID) -> Data? {
+        guard let statement = try? prepare(sql, [.text(id.uuidString)]) else { return nil }
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
         let size = Int(sqlite3_column_bytes(statement, 0))

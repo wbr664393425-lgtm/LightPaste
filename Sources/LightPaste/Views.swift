@@ -17,6 +17,7 @@ struct SettingsView: View {
 
                 section("通用", symbol: "keyboard") {
                     row("唤起快捷键") { ShortcutRecorder(controller: controller) }
+                    row("光标处粘贴") { ShortcutRecorder(controller: controller, quick: true) }
                     row("抽屉位置") {
                         Picker("抽屉位置", selection: saved(\.drawerEdge)) {
                             ForEach(DrawerEdge.allCases) { Text($0.title).tag($0) }
@@ -196,6 +197,8 @@ struct SettingsView: View {
 /// Click, then press the new combination. Esc cancels; the old shortcut stays until a valid one is pressed.
 struct ShortcutRecorder: View {
     @ObservedObject var controller: AppController
+    /// Records the quick-paste shortcut instead of the drawer's.
+    var quick = false
     @State private var recording = false
     @State private var monitor: Any?
     @State private var hint = ""
@@ -204,7 +207,7 @@ struct ShortcutRecorder: View {
         HStack(spacing: DS.Space.s) {
             if !hint.isEmpty { Text(hint).font(.ds(DS.Size.caption)).foregroundStyle(DS.warning) }
             Button { recording ? stop() : start() } label: {
-                Text(recording ? "按下新的快捷键…" : controller.hotKey.label)
+                Text(recording ? "按下新的快捷键…" : current.label)
                     .font(.ds(DS.Size.body, .medium)).monospacedDigit()
                     .frame(minWidth: 132).frame(height: 26)
                     .foregroundStyle(recording ? DS.accent : DS.ink)
@@ -212,10 +215,12 @@ struct ShortcutRecorder: View {
                     .overlay(RoundedRectangle(cornerRadius: DS.Radius.small).stroke(recording ? DS.accent : DS.line))
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(recording ? "正在录制快捷键" : "唤起快捷键：\(controller.hotKey.label)，点击后按下新组合")
+            .accessibilityLabel(recording ? "正在录制快捷键" : "\(quick ? "光标处粘贴" : "唤起")快捷键：\(current.label)，点击后按下新组合")
         }
         .onDisappear { stop() }
     }
+
+    private var current: HotKeySpec { quick ? controller.quickHotKey : controller.hotKey }
 
     private func start() {
         hint = ""
@@ -227,7 +232,10 @@ struct ShortcutRecorder: View {
                 hint = "需包含 ⌘、⌥ 或 ⌃"
                 return nil
             }
-            if controller.setHotKey(spec) { hint = "" } else { hint = "已被占用" }
+            let other = quick ? controller.hotKey : controller.quickHotKey
+            if spec == other { hint = "与另一个快捷键相同"; controller.resumeHotKey() }
+            else if quick ? controller.setQuickHotKey(spec) : controller.setHotKey(spec) { hint = "" }
+            else { hint = "已被占用" }
             stop(resume: false)
             return nil
         }

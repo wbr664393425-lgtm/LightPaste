@@ -49,16 +49,6 @@ enum DS {
     static let warning = dynamic(light: (0.70, 0.36, 0.10), dark: (0.96, 0.66, 0.38))
     static let field = dynamic(light: (1, 1, 1), dark: (0.16, 0.16, 0.17), alpha: 0.85)
 
-    static func tint(for kind: ClipKind) -> Color {
-        switch kind {
-        case .text: return dynamic(light: (0.86, 0.92, 0.86), dark: (0.22, 0.31, 0.24))
-        case .link: return dynamic(light: (0.84, 0.90, 0.96), dark: (0.20, 0.28, 0.36))
-        case .image: return dynamic(light: (0.95, 0.87, 0.86), dark: (0.36, 0.24, 0.25))
-        case .files: return dynamic(light: (0.95, 0.90, 0.80), dark: (0.36, 0.30, 0.19))
-        case .other: return dynamic(light: (0.90, 0.88, 0.95), dark: (0.29, 0.26, 0.36))
-        }
-    }
-
     static func tint(for detail: ClipDetail) -> Color {
         switch detail {
         case .code: return dynamic(light: (0.88, 0.88, 0.94), dark: (0.24, 0.24, 0.33))

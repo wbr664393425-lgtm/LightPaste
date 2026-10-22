@@ -234,7 +234,8 @@ final class NativeCardInteractionView: NSView, NSDraggingSource {
 
         menu.addItem(.separator())
         if controller.canFetchLinkPreview(item) {
-            menu.addItem(NativeCardMenuItem("获取链接标题") { [weak controller] in controller?.fetchLinkPreview(item.id) })
+            let title = item.linkTitle?.isEmpty == false ? "刷新链接预览" : "获取链接预览"
+            menu.addItem(NativeCardMenuItem(title) { [weak controller] in controller?.fetchLinkPreview(item.id) })
         }
         if controller.openableURLs(for: item) != nil {
             let open = NativeCardMenuItem(item.kind == .link ? "打开链接" : "打开") { [weak controller] in controller?.openItem(item.id) }

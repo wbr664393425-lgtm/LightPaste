@@ -13,7 +13,7 @@
 | 技术栈 | Swift 5 语言模式（本机 Swift 6.2 工具链）、AppKit + SwiftUI、SQLite3（系统库）、CryptoKit、Vision、LinkPresentation、QuickLookThumbnailing、ServiceManagement、Carbon 热键 |
 | 最低系统 | macOS 13 |
 | 构建 | `./build.sh`：`swift build -c release`，组装 `轻贴.app` 并临时签名；设 `LIGHTPASTE_SIGN_IDENTITY` / `LIGHTPASTE_NOTARY_PROFILE` 时改为 Developer ID 签名并公证；只需 Command Line Tools |
-| 版本 | `build.sh` 顶部 `APP_VERSION` / `APP_BUILD`（当前 0.6.0 / 6），与 CHANGELOG 一致 |
+| 版本 | `build.sh` 顶部 `APP_VERSION` / `APP_BUILD`（当前 0.7.0 / 7），与 CHANGELOG 一致 |
 | Bundle ID | `com.local.lightpaste` |
 | 数据目录 | `~/Library/Application Support/LightPaste/`（目录 0700，数据库及 -wal/-shm 0600） |
 | 安装位置 | `/Applications/轻贴.app`（本机） |
@@ -31,7 +31,8 @@
 | 去重指纹 | `HistoryStore.fingerprint` | `clips.fingerprint`（UNIQUE） | 全部载荷的 SHA-256 |
 | 过期时间 | `ClipItem.expiresAt` | `clips.expires_at` | 验证码 5 分钟；敏感内容默认 10 分钟；收藏不过期 |
 | 图片文字 | `ClipItem.ocrText` | `clips.ocr_text` | 空串表示已识别但无文字 |
-| 链接标题 / 图标 | `ClipItem.linkTitle` | `clips.link_title`、表 `link_icons(clip_id, png)` | 空串表示抓取失败，不再重试 |
+| 链接标题 / 图标 / 封面 | `ClipItem.linkTitle` | `clips.link_title`、表 `link_icons(clip_id, png)`、`link_images(clip_id, jpeg)` | 空串表示抓取失败，不再自动重试 |
+| 光标处粘贴 | `QuickPasteModel` | 偏好 `quickHotKeyCode` / `quickHotKeyModifiers` | 默认 ⌥⇧Space，独立查询与选中 |
 | 收藏分类 | `FavoriteBoard` | 表 `boards`、`board_membership(clip_id, board_id)` | 删除分类保留内容与收藏 |
 | 一次采集 | `CapturedClip` → `HistoryStore.PreparedCapture` | — | 采集中间态：摘要、指纹、识别结果、编码后载荷 |
 | 筛选 | `SidebarFilter`、`DateFilter`、来源 `sourceFilter` | 内存 | 日期按最近复制时间 |
@@ -58,10 +59,11 @@
 | 粘贴转换 | `TextTransform.swift` | “粘贴为”的各项转换，纯 Foundation |
 | 联网与图标 | `Enrichment.swift` | `OCRService`（Vision）、`LinkPreviewService`（LPMetadataProvider；`allowsAutomaticFetch` 自动预览规则）、`IconProvider`（应用图标、主色、Quick Look 缩略图） |
 | 抽屉界面 | `DrawerView.swift` | 工具栏（分类标签、筛选菜单、搜索框）、底栏 / 批量栏、`DrawerClipCard`（卡片内容，Equatable） |
+| 光标处粘贴 | `QuickPaste.swift` | `QuickPasteModel`（独立查询、结果前 60 条）、`QuickPasteView`（列表 + 只读卡片预览）；窗口与按键在 `AppController.showQuickPaste` / `handleQuickKey`，光标定位 `PasteService.caretRect` |
 | 卡片条 | `NativeCardStrip.swift` | `NSCollectionView` 单行横排、按类型复用单元格、增量插删、选中居中滚动 |
 | 卡片交互 | `NativeCardInteraction.swift` | 卡片上的透明 AppKit 层：单 / 双击、⌘ / ⇧ 多选、拖出、右键菜单 |
 | 分类拖入 | `NativeBoardInteraction.swift` | 分类标签的拖放目标 |
-| 系统服务 | `SystemServices.swift` | `HotKeyManager`、`HotKeySpec`、`ClipboardWindow`（抽屉面板，拦截按键）、`PasteService`（写剪贴板、模拟 ⌘V、焦点检测） |
+| 系统服务 | `SystemServices.swift` | `HotKeyManager`（按 id 注册：1 抽屉、2 光标处粘贴）、`HotKeySpec`、`ClipboardWindow`（抽屉面板，拦截按键）、`PasteService`（写剪贴板、模拟 ⌘V、焦点检测） |
 | 编辑窗口 | `ItemEditor.swift` | `ItemEditorController`：富文本编辑、写作工具、保存为 RTF + 纯文本 |
 | 预览 | `ItemPreviewView.swift` | 空格预览窗口内容 |
 | 设置 / 引导 | `Views.swift` | `SettingsView`、`ShortcutRecorder`、`ExcludedAppsPicker`、`OnboardingView` |
@@ -75,7 +77,8 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `build.sh` | Release 构建、生成 Info.plist、图标、临时签名 |
+| `build.sh` | Release 构建、生成 Info.plist、图标；有本机证书时固定签名，否则临时签名 |
+| `Scripts/MakeLocalSigningIdentity.sh` | 在登录钥匙串创建自签名证书 “LightPaste Local Signing”，重新构建后保留辅助功能授权 |
 | `Scripts/VerifyCore.swift` | 存储核心 30 项（去重、持久化、迁移、收藏、清理、搜索、编辑、副本、后台写入、排除应用时序、敏感全文扫描、拼音与搜索语法、收藏导出导入） |
 | `Scripts/VerifyDetection.swift` | 内容识别、链接预览规则与粘贴转换 65 项 |
 | `Scripts/VerifyResources.swift` | 后台资源 5 项 |
@@ -169,7 +172,7 @@ scheduleEnrichment()（历史变化后触发）
   ├─ runNextOCR()：逐张图片 → ClipResources.ocrImage → OCRService（Vision，本机）→ store.setOCRText
   │    setOCRText：识别出密钥 → detail = sensitive 并设置到期时间
   └─ 链接预览（默认开启，最多 2 个并发）：LinkPreviewService.webURL
-        → 敏感或 allowsAutomaticFetch == false → 记空标题（右键“获取链接标题”可手动一次）
+        → 敏感或 allowsAutomaticFetch == false → 记空标题（右键“获取链接预览”可手动获取，已有预览可刷新）
         → startLinkFetch → fetch（联网，8 秒超时）→ 回写前核对令牌与当前链接 → store.setLinkPreview
         关闭设置会取消进行中的请求；编辑保存会取消该条在途请求
 ```
@@ -198,7 +201,8 @@ scheduleEnrichment()（历史变化后触发）
 | 打开 / 在访达中显示 | ⌘O、右键 | `openItem`、`revealItem` |
 | 粘贴为 | 卡片右键 | `transforms(for:)`、`paste(_:as:)` → `useSelected(transform:)` |
 | 合并粘贴 | 多选底栏 | `pasteMerged(separator:)` |
-| 获取链接标题 | 卡片右键（被规则跳过或失败的链接） | `fetchLinkPreview` |
+| 获取 / 刷新链接预览 | 卡片右键（非敏感链接） | `fetchLinkPreview` |
+| 光标处粘贴 | ⌥⇧Space、菜单栏右键 | `toggleQuickPaste` → `showQuickPaste`，按键 `handleQuickKey` |
 | 导出 / 导入收藏 | 设置“本机数据” | `exportFavorites`、`importFavorites` → `HistoryStore.exportFavorites` / `importFavorites` |
 
 偏好设置键（`UserDefaults`）：`retentionDays`、`maxItems`、`drawerEdge`、`cardSize`、`linkPreview`、`ocr`、`sensitiveMinutes`、`alwaysPlainText`、`plainTextApps`（默认终端、iTerm2、VS Code、Xcode）、`hideDuringScreenShare`、`excludedApps`（默认含常见密码管理器）、`hotKeyCode`、`hotKeyModifiers`、`onboardingDone`；0.3 遗留 `shortcutOption`。
